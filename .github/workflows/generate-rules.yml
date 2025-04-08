@@ -1,0 +1,93 @@
+name: Generate Rules
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+jobs:
+  generate-rules:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        run: mkdir -p shadowrocket mihomo
+
+      - name: Download Shadowrocket rule modules
+        run: |
+          declare -A urls=(
+            [direct]="sr_direct_list.module"
+            [proxy]="sr_proxy_list.module"
+            [reject]="sr_reject_list.module"
+          )
+          for type in "${!urls[@]}"; do
+            echo "Downloading ${urls[$type]}"
+            curl -s "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" -o "temp.module"
+            sed '1,/^\[Rule\]$/d' temp.module | \
+              sed "s/,${type^^}$//" | \
+              sed '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' > "shadowrocket/${type}.list"
+            rm temp.module
+          done
+
+      - name: Merge SteamCN rules into direct.list
+        run: |
+          echo "Merging SteamCN rules..."
+          curl -s https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list -o steamcn.list
+          grep -v '^#' steamcn.list >> shadowrocket/direct.list
+          sort -u shadowrocket/direct.list -o shadowrocket/direct.list
+          rm steamcn.list
+
+      - name: Deduplicate DOMAIN vs DOMAIN-SUFFIX
+        run: |
+          echo "Deduplicating $file..."
+          for file in shadowrocket/*.list; do
+            grep "^DOMAIN-SUFFIX," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > suffixes.txt
+            grep "^DOMAIN," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > domains.txt
+
+            cp "$file" temp_file.txt
+
+            while read -r domain; do
+              # 如果这个 domain 完全等于某个 DOMAIN-SUFFIX
+              if grep -q "^$domain$" suffixes.txt; then
+                sed -i "/^DOMAIN,${domain}$/Id" temp_file.txt
+                continue
+              fi
+
+              # 如果这个 domain 被某个 suffix 包含（domain 是 suffix 的子域名）
+              while read -r suffix; do
+                if [[ "$domain" == *.$suffix ]]; then
+                  sed -i "/^DOMAIN,${domain}$/Id" temp_file.txt
+                  break
+                fi
+              done < suffixes.txt
+
+            done < domains.txt
+
+            sort -fu temp_file.txt > "$file"
+            rm -f temp_file.txt suffixes.txt domains.txt
+          done
+
+      - name: Convert rules to Mihomo format
+        run: |
+          echo "Converting Shadowrocket rules to Mihomo..."
+          for type in direct proxy reject; do
+            sed 's/^URL-REGEX/^DOMAIN-REGEX/' "shadowrocket/${type}.list" > "mihomo/${type}.list"
+          done
+
+      - name: Commit and Push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add shadowrocket/*.list mihomo/*.list
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update rule lists - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            git push
+          fi
