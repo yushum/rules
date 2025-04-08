@@ -9,12 +9,7 @@ All rules are optimized for daily use, with a focus on simplicity, maintainabili
 
 ## Usage (Shadowrocket)
 
-To use the pre-configured Shadowrocket `.conf` file:
-
-1. Open **Shadowrocket**, go to the **Config** tab.
-2. Tap the **"+"** button at the top-right corner.
-3. In the URL field, paste: `https://raw.githubusercontent.com/yushum/rules/refs/heads/master/shadowrocket.conf`
-4. Tap **Download**.
+To use the pre-configured Shadowrocket `.conf` file, just click [here](shadowrocket://config/add/https://raw.githubusercontent.com/yushum/rules/refs/heads/master/shadowrocket.conf).
 
 That's it — your configuration will be loaded automatically.
 
