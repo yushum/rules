@@ -11,6 +11,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }} # 确保 checkout 使用 token
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,9 +38,11 @@ jobs:
 
       - name: Commit and push changes
         if: steps.check_changes.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 传递 token 给环境变量
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add shadowrocket/ mihomo/
           git commit -m "Update rules on $(date +'%Y-%m-%d %H:%M:%S UTC')"
-          git push
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/yushum/rules.git HEAD:master
