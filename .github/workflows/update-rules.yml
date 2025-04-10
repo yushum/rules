@@ -2,35 +2,41 @@ name: Update Shadowrocket and Mihomo Rules
 
 on:
   schedule:
-    - cron: '0 23 * * *'  # 每天北京时间7点（UTC时间23点）
-  workflow_dispatch:
+    - cron: '0 23 * * *' # 北京时间 7:00 (UTC 23:00)
+  workflow_dispatch: # 允许手动触发
 
 jobs:
   update-rules:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      - name: Set up Python environment
-        uses: actions/setup-python@v2
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install requests
 
-      - name: Run Python script to process and update rules
-        run: |
-          python .github/scripts/update_rules.py
+      - name: Run rule generation script
+        run: python .github/scripts/generate_rules.py
 
-      - name: Commit and push updated rules
-        if: steps.update-rules.outputs.changed == 'true'
+      - name: Check for changes
+        id: changes
         run: |
-          git config --global user.email "your-email@example.com"
-          git config --global user.name "GitHub Actions"
-          git add .
-          git commit -m "Update Shadowrocket and Mihomo rules"
+          git diff --quiet && echo "changed=false" >> $GITHUB_OUTPUT || echo "changed=true" >> $GITHUB_OUTPUT
+        outputs:
+          changed: ${{ steps.changes.outputs.changed }}
+
+      - name: Commit and push changes
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add shadowrocket/ mihomo/
+          git commit -m "Update rules on $(date +'%Y-%m-%d %H:%M:%S UTC')"
           git push
