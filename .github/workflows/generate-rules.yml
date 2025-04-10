@@ -5,7 +5,7 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 23 * * *'
+    - cron: '0 23 * * *'  # 每天 23:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -13,11 +13,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 检出代码
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
+      # 缓存远程文件以检测变化
       - name: Cache previous remote files
         id: cache-remote
         uses: actions/cache@v3
@@ -30,15 +32,18 @@ jobs:
           key: remote-files-${{ github.run_id }}
           restore-keys: remote-files-
 
-      - name: Check for changes in custom files and remote sources
+      # 检测变化（自定义脚本）
+      - name: Check for changes
         id: check-changes
         run: |
+          # 检查自定义文件变化
           CUSTOM_CHANGED=false
           if [ -d custom ] && git diff --name-only HEAD^ HEAD -- custom/*.list | grep -q .; then
             CUSTOM_CHANGED=true
             echo "Custom files have changed"
           fi
 
+          # 检查远程文件变化
           declare -A urls=(
             [direct]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_direct_list.module"
             [proxy]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_proxy_list.module"
@@ -48,26 +53,17 @@ jobs:
 
           REMOTE_CHANGED=false
           for type in "${!urls[@]}"; do
-            curl -s -I "${urls[$type]}" -o headers.txt
-            ETAG=$(grep -i "ETag" headers.txt | cut -d'"' -f2)
-            LAST_MODIFIED=$(grep -i "Last-Modified" headers.txt | cut -d' ' -f2-)
-            echo "${type}_etag=$ETAG" >> $GITHUB_OUTPUT
-            echo "${type}_last_modified=$LAST_MODIFIED" >> $GITHUB_OUTPUT
-
+            curl -s "${urls[$type]}" -o "new_${type}.tmp"
             if [ -f "old_${type}.tmp" ]; then
-              OLD_HASH=$(sha256sum "old_${type}.tmp" | cut -d' ' -f1)
-              curl -s "${urls[$type]}" -o "new_${type}.tmp"
-              NEW_HASH=$(sha256sum "new_${type}.tmp" | cut -d' ' -f1)
-              if [ "$OLD_HASH" != "$NEW_HASH" ]; then
+              if ! cmp -s "old_${type}.tmp" "new_${type}.tmp"; then
                 REMOTE_CHANGED=true
                 echo "${urls[$type]} has changed"
               fi
-              mv "new_${type}.tmp" "old_${type}.tmp"
             else
-              curl -s "${urls[$type]}" -o "old_${type}.tmp"
               REMOTE_CHANGED=true
               echo "No previous ${type} file found"
             fi
+            mv "new_${type}.tmp" "old_${type}.tmp"
           done
 
           if [ "$CUSTOM_CHANGED" = true ] || [ "$REMOTE_CHANGED" = true ]; then
@@ -77,7 +73,8 @@ jobs:
           fi
         continue-on-error: true
 
-      - name: Exit if no changes or check failed
+      # 如果没有变化或检测失败，则退出
+      - name: Exit if no changes
         if: steps.check-changes.outputs.changes_detected != 'true'
         run: |
           if [ "${{ steps.check-changes.outcome }}" = "failure" ]; then
@@ -88,9 +85,11 @@ jobs:
             exit 0
           fi
 
+      # 创建目录
       - name: Prepare folders
         run: mkdir -p shadowrocket mihomo custom
 
+      # 下载并处理规则
       - name: Process rules
         run: |
           declare -A urls=(
@@ -106,11 +105,12 @@ jobs:
             rm temp.module
           done
 
-          curl -s https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list -o steamcn.list
-          grep -v '^#' steamcn.list >> shadowrocket/direct.list
+          # 处理 SteamCN 规则
+          curl -s https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list | \
+            grep -v '^#' >> shadowrocket/direct.list
           sort -u shadowrocket/direct.list -o shadowrocket/direct.list
-          rm steamcn.list
 
+          # 合并自定义规则
           for type in direct proxy reject; do
             if [ -f "custom/${type}.list" ]; then
               grep -v '^#' "custom/${type}.list" >> "shadowrocket/${type}.list"
@@ -118,7 +118,7 @@ jobs:
             fi
           done
 
-          # 优化后的去重步骤
+          # 高效去重（使用 awk 处理 DOMAIN-SUFFIX 和 DOMAIN 包含关系）
           for file in shadowrocket/*.list; do
             awk -F',' '
               BEGIN {
@@ -162,18 +162,15 @@ jobs:
             mv temp_file.txt "$file"
           done
 
+          # 生成 mihomo 规则
           for type in direct proxy reject; do
             sed 's/^URL-REGEX/^DOMAIN-REGEX/' "shadowrocket/${type}.list" > "mihomo/${type}.list"
           done
 
+      # 使用现成的 git-auto-commit-action 提交更改
       - name: Commit and Push changes
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add shadowrocket/*.list mihomo/*.list
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Update rule lists - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            git push
-          fi
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update rule lists - ${{ github.run_id }} - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          file_pattern: 'shadowrocket/*.list mihomo/*.list'
+          skip_dirty_check: false  # 仅在有更改时提交
