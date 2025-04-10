@@ -111,6 +111,7 @@ DOMAIN,crl.apple.com
 DOMAIN,crl.globalsign.net
 DOMAIN,crl.pki.goog
 DOMAIN,crls.pki.goog
+DOMAIN,csgo.wmsj.cn
 DOMAIN,csi.gstatic.com
 DOMAIN,cstat.apple.com
 DOMAIN,cstat.cdn-apple.com
@@ -130,6 +131,7 @@ DOMAIN,dl.google.com
 DOMAIN,dl.l.google.com
 DOMAIN,dns.corp.google.com
 DOMAIN,docs.microsoft.com
+DOMAIN,dota2.wmsj.cn
 DOMAIN,doubleclick-cn.net
 DOMAIN,doubleclick.net
 DOMAIN,download.developer.apple.com
@@ -22881,6 +22883,7 @@ DOMAIN-SUFFIX,clzyqche.com
 DOMAIN-SUFFIX,cm-analysis.com
 DOMAIN-SUFFIX,cm-iov.com
 DOMAIN-SUFFIX,cm-worklink.com
+DOMAIN-SUFFIX,cm.steampowered.com
 DOMAIN-SUFFIX,cm1881.com
 DOMAIN-SUFFIX,cm233.com
 DOMAIN-SUFFIX,cm3721.com
@@ -82682,6 +82685,7 @@ DOMAIN-SUFFIX,steambig.com
 DOMAIN-SUFFIX,steamboxs.com
 DOMAIN-SUFFIX,steamchina.com
 DOMAIN-SUFFIX,steamcn.com
+DOMAIN-SUFFIX,steamcontent.com
 DOMAIN-SUFFIX,steamdd.com
 DOMAIN-SUFFIX,steamhost.info
 DOMAIN-SUFFIX,steammm.com
@@ -82689,6 +82693,8 @@ DOMAIN-SUFFIX,steampp.net
 DOMAIN-SUFFIX,steamproxy.net
 DOMAIN-SUFFIX,steampy.com
 DOMAIN-SUFFIX,steamrepcn.com
+DOMAIN-SUFFIX,steamserver.net
+DOMAIN-SUFFIX,steamusercontent.com
 DOMAIN-SUFFIX,steamxdf.com
 DOMAIN-SUFFIX,stec.net
 DOMAIN-SUFFIX,steel-mate.com
