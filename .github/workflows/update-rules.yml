@@ -1,0 +1,36 @@
+name: Update Shadowrocket and Mihomo Rules
+
+on:
+  schedule:
+    - cron: '0 23 * * *'  # 每天北京时间7点（UTC时间23点）
+  workflow_dispatch:
+
+jobs:
+  update-rules:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Python environment
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Python script to process and update rules
+        run: |
+          python .github/scripts/update_rules.py
+
+      - name: Commit and push updated rules
+        if: steps.update-rules.outputs.changed == 'true'
+        run: |
+          git config --global user.email "your-email@example.com"
+          git config --global user.name "GitHub Actions"
+          git add .
+          git commit -m "Update Shadowrocket and Mihomo rules"
+          git push
