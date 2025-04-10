@@ -118,17 +118,48 @@ jobs:
             fi
           done
 
+          # 优化后的去重步骤
           for file in shadowrocket/*.list; do
-            grep "^DOMAIN-SUFFIX," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > suffixes.txt
-            grep "^DOMAIN," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > domains.txt
-            cp "$file" temp_file.txt
-            while read -r domain; do
-              if grep -q "^$domain$" suffixes.txt || grep -q "^.*\.$domain$" suffixes.txt; then
-                sed -i "/^DOMAIN,${domain}$/Id" temp_file.txt
-              fi
-            done < domains.txt
-            sort -fu temp_file.txt > "$file"
-            rm -f temp_file.txt suffixes.txt domains.txt
+            awk -F',' '
+              BEGIN {
+                delete suffixes; delete domains; delete others;
+              }
+              /^DOMAIN-SUFFIX,/ {
+                suffix = tolower($2);
+                suffixes[suffix] = $0;
+                next;
+              }
+              /^DOMAIN,/ {
+                domain = tolower($2);
+                domains[domain] = $0;
+                next;
+              }
+              { others[$0] = 1; next; }
+              END {
+                for (domain in domains) {
+                  keep = 1;
+                  for (suffix in suffixes) {
+                    if (domain == suffix || (index(domain, "." suffix) > 0 && domain ~ "[.]" suffix "$")) {
+                      keep = 0; break;
+                    }
+                  }
+                  if (keep) filtered_domains[domain] = domains[domain];
+                }
+                for (suffix in suffixes) {
+                  keep = 1;
+                  for (s in suffixes) {
+                    if (s != suffix && (index(suffix, "." s) > 0 && suffix ~ "[.]" s "$")) {
+                      keep = 0; break;
+                    }
+                  }
+                  if (keep) filtered_suffixes[suffix] = suffixes[suffix];
+                }
+                for (suffix in filtered_suffixes) print filtered_suffixes[suffix];
+                for (domain in filtered_domains) print filtered_domains[domain];
+                for (other in others) print other;
+              }
+            ' "$file" | sort -u > temp_file.txt
+            mv temp_file.txt "$file"
           done
 
           for type in direct proxy reject; do
