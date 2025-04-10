@@ -16,19 +16,29 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2  # 获取最近两次提交以比较变化
+          fetch-depth: 2
+
+      - name: Cache previous remote files
+        id: cache-remote
+        uses: actions/cache@v3
+        with:
+          path: |
+            old_direct.tmp
+            old_proxy.tmp
+            old_reject.tmp
+            old_steamcn.tmp
+          key: remote-files-${{ github.run_id }}
+          restore-keys: remote-files-
 
       - name: Check for changes in custom files and remote sources
         id: check-changes
         run: |
-          # 检查 custom 目录文件变化
           CUSTOM_CHANGED=false
-          if git diff HEAD^ HEAD -- custom/*.list | grep -q .; then
+          if [ -d custom ] && git diff --name-only HEAD^ HEAD -- custom/*.list | grep -q .; then
             CUSTOM_CHANGED=true
             echo "Custom files have changed"
           fi
 
-          # 检查远程文件变化
           declare -A urls=(
             [direct]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_direct_list.module"
             [proxy]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_proxy_list.module"
@@ -38,35 +48,50 @@ jobs:
 
           REMOTE_CHANGED=false
           for type in "${!urls[@]}"; do
-            # 下载当前版本
-            curl -s "${urls[$type]}" -o "new_${type}.tmp"
-            # 如果本地存在旧版本则比较
+            curl -s -I "${urls[$type]}" -o headers.txt
+            ETAG=$(grep -i "ETag" headers.txt | cut -d'"' -f2)
+            LAST_MODIFIED=$(grep -i "Last-Modified" headers.txt | cut -d' ' -f2-)
+            echo "${type}_etag=$ETAG" >> $GITHUB_OUTPUT
+            echo "${type}_last_modified=$LAST_MODIFIED" >> $GITHUB_OUTPUT
+
             if [ -f "old_${type}.tmp" ]; then
-              if ! cmp -s "new_${type}.tmp" "old_${type}.tmp"; then
+              OLD_HASH=$(sha256sum "old_${type}.tmp" | cut -d' ' -f1)
+              curl -s "${urls[$type]}" -o "new_${type}.tmp"
+              NEW_HASH=$(sha256sum "new_${type}.tmp" | cut -d' ' -f1)
+              if [ "$OLD_HASH" != "$NEW_HASH" ]; then
                 REMOTE_CHANGED=true
                 echo "${urls[$type]} has changed"
               fi
+              mv "new_${type}.tmp" "old_${type}.tmp"
             else
+              curl -s "${urls[$type]}" -o "old_${type}.tmp"
               REMOTE_CHANGED=true
-              echo "No previous ${type} file found, treating as changed"
+              echo "No previous ${type} file found"
             fi
-            # 保存当前版本为旧版本
-            mv "new_${type}.tmp" "old_${type}.tmp"
           done
 
-          # 设置输出变量
           if [ "$CUSTOM_CHANGED" = true ] || [ "$REMOTE_CHANGED" = true ]; then
             echo "changes_detected=true" >> $GITHUB_OUTPUT
           else
             echo "changes_detected=false" >> $GITHUB_OUTPUT
           fi
+        continue-on-error: true
+
+      - name: Exit if no changes or check failed
+        if: steps.check-changes.outputs.changes_detected != 'true'
+        run: |
+          if [ "${{ steps.check-changes.outcome }}" = "failure" ]; then
+            echo "Change detection failed, assuming changes to be safe"
+            exit 1
+          else
+            echo "No changes detected, skipping build"
+            exit 0
+          fi
 
       - name: Prepare folders
-        if: steps.check-changes.outputs.changes_detected == 'true'
         run: mkdir -p shadowrocket mihomo custom
 
-      - name: Download Shadowrocket rule modules
-        if: steps.check-changes.outputs.changes_detected == 'true'
+      - name: Process rules
         run: |
           declare -A urls=(
             [direct]="sr_direct_list.module"
@@ -74,7 +99,6 @@ jobs:
             [reject]="sr_reject_list.module"
           )
           for type in "${!urls[@]}"; do
-            echo "Downloading ${urls[$type]}"
             curl -s "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" -o "temp.module"
             sed '1,/^\[Rule\]$/d' temp.module | \
               sed "s/,${type^^}$//" | \
@@ -82,66 +106,36 @@ jobs:
             rm temp.module
           done
 
-      - name: Merge SteamCN rules into direct.list
-        if: steps.check-changes.outputs.changes_detected == 'true'
-        run: |
-          echo "Merging SteamCN rules..."
           curl -s https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list -o steamcn.list
           grep -v '^#' steamcn.list >> shadowrocket/direct.list
           sort -u shadowrocket/direct.list -o shadowrocket/direct.list
           rm steamcn.list
 
-      - name: Merge custom rules
-        if: steps.check-changes.outputs.changes_detected == 'true'
-        run: |
-          echo "Merging custom rules..."
           for type in direct proxy reject; do
             if [ -f "custom/${type}.list" ]; then
-              echo "Merging custom/${type}.list into shadowrocket/${type}.list"
               grep -v '^#' "custom/${type}.list" >> "shadowrocket/${type}.list"
               sort -u "shadowrocket/${type}.list" -o "shadowrocket/${type}.list"
-            else
-              echo "No custom/${type}.list found, skipping"
             fi
           done
 
-      - name: Deduplicate DOMAIN vs DOMAIN-SUFFIX
-        if: steps.check-changes.outputs.changes_detected == 'true'
-        run: |
-          echo "Deduplicating $file..."
           for file in shadowrocket/*.list; do
             grep "^DOMAIN-SUFFIX," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > suffixes.txt
             grep "^DOMAIN," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > domains.txt
-
             cp "$file" temp_file.txt
-
             while read -r domain; do
-              if grep -q "^$domain$" suffixes.txt; then
+              if grep -q "^$domain$" suffixes.txt || grep -q "^.*\.$domain$" suffixes.txt; then
                 sed -i "/^DOMAIN,${domain}$/Id" temp_file.txt
-                continue
               fi
-              while read -r suffix; do
-                if [[ "$domain" == *.$suffix ]]; then
-                  sed -i "/^DOMAIN,${domain}$/Id" temp_file.txt
-                  break
-                fi
-              done < suffixes.txt
             done < domains.txt
-
             sort -fu temp_file.txt > "$file"
             rm -f temp_file.txt suffixes.txt domains.txt
           done
 
-      - name: Convert rules to Mihomo format
-        if: steps.check-changes.outputs.changes_detected == 'true'
-        run: |
-          echo "Converting Shadowrocket rules to Mihomo..."
           for type in direct proxy reject; do
             sed 's/^URL-REGEX/^DOMAIN-REGEX/' "shadowrocket/${type}.list" > "mihomo/${type}.list"
           done
 
       - name: Commit and Push changes
-        if: steps.check-changes.outputs.changes_detected == 'true'
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
@@ -152,7 +146,3 @@ jobs:
             git commit -m "Update rule lists - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             git push
           fi
-
-      - name: Skip build if no changes
-        if: steps.check-changes.outputs.changes_detected == 'false'
-        run: echo "No changes detected in source files, skipping build"
