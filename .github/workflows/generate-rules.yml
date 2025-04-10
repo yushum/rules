@@ -15,79 +15,128 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Prepare folders
-        run: mkdir -p shadowrocket mihomo
-
-      - name: Download Shadowrocket rule modules
+      - name: Detect Changes
+        id: check
         run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "Detecting custom changes..."
+          CUSTOM_CHANGED=false
+          if git rev-parse HEAD^ >/dev/null 2>&1 && git diff HEAD^ HEAD -- custom/*.list | grep -q .; then
+            CUSTOM_CHANGED=true
+            echo "Custom rules changed."
+          fi
+
+          echo "Checking remote rule updates..."
+          mkdir -p .cache
+          REMOTE_CHANGED=false
+          declare -A urls=(
+            [direct]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_direct_list.module"
+            [proxy]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_proxy_list.module"
+            [reject]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_reject_list.module"
+            [steamcn]="https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list"
+          )
+
+          for type in "${!urls[@]}"; do
+            curl -fsSL "${urls[$type]}" -o ".cache/new_${type}"
+            if [ -f ".cache/old_${type}" ]; then
+              if ! cmp -s ".cache/new_${type}" ".cache/old_${type}"; then
+                REMOTE_CHANGED=true
+                echo "${type} changed."
+              fi
+            else
+              REMOTE_CHANGED=true
+              echo "${type} is new."
+            fi
+            cp ".cache/new_${type}" ".cache/old_${type}"
+          done
+
+          if $CUSTOM_CHANGED || $REMOTE_CHANGED; then
+            echo "changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare Folders
+        if: steps.check.outputs.changes == 'true'
+        run: mkdir -p shadowrocket mihomo custom
+
+      - name: Download and Process Shadowrocket Rules
+        if: steps.check.outputs.changes == 'true'
+        run: |
+          set -e
           declare -A urls=(
             [direct]="sr_direct_list.module"
             [proxy]="sr_proxy_list.module"
             [reject]="sr_reject_list.module"
           )
           for type in "${!urls[@]}"; do
-            echo "Downloading ${urls[$type]}"
-            curl -s "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" -o "temp.module"
+            echo "Processing $type"
+            curl -fsSL "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" -o temp.module
             sed '1,/^\[Rule\]$/d' temp.module | \
               sed "s/,${type^^}$//" | \
               sed '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' > "shadowrocket/${type}.list"
-            rm temp.module
+            rm -f temp.module
           done
 
-      - name: Merge SteamCN rules into direct.list
+      - name: Merge SteamCN into Direct
+        if: steps.check.outputs.changes == 'true'
         run: |
-          echo "Merging SteamCN rules..."
-          curl -s https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list -o steamcn.list
-          grep -v '^#' steamcn.list >> shadowrocket/direct.list
+          curl -fsSL "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list" \
+            | grep -v '^#' >> shadowrocket/direct.list
           sort -u shadowrocket/direct.list -o shadowrocket/direct.list
-          rm steamcn.list
+
+      - name: Merge Custom Rules
+        if: steps.check.outputs.changes == 'true'
+        run: |
+          for type in direct proxy reject; do
+            [ -f "shadowrocket/${type}.list" ] || touch "shadowrocket/${type}.list"
+            if [ -f "custom/${type}.list" ]; then
+              grep -v '^#' "custom/${type}.list" >> "shadowrocket/${type}.list"
+              sort -u "shadowrocket/${type}.list" -o "shadowrocket/${type}.list"
+            fi
+          done
 
       - name: Deduplicate DOMAIN vs DOMAIN-SUFFIX
+        if: steps.check.outputs.changes == 'true'
         run: |
-          echo "Deduplicating $file..."
           for file in shadowrocket/*.list; do
-            grep "^DOMAIN-SUFFIX," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > suffixes.txt
-            grep "^DOMAIN," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > domains.txt
-
-            cp "$file" temp_file.txt
-
-            while read -r domain; do
-              # 如果这个 domain 完全等于某个 DOMAIN-SUFFIX
-              if grep -q "^$domain$" suffixes.txt; then
-                sed -i "/^DOMAIN,${domain}$/Id" temp_file.txt
-                continue
-              fi
-
-              # 如果这个 domain 被某个 suffix 包含（domain 是 suffix 的子域名）
-              while read -r suffix; do
-                if [[ "$domain" == *.$suffix ]]; then
-                  sed -i "/^DOMAIN,${domain}$/Id" temp_file.txt
-                  break
-                fi
-              done < suffixes.txt
-
-            done < domains.txt
-
-            sort -fu temp_file.txt > "$file"
-            rm -f temp_file.txt suffixes.txt domains.txt
+            awk -F, '
+              BEGIN { OFS="," }
+              tolower($1) == "domain-suffix" { suffix[tolower($2)] = 1; next }
+              tolower($1) == "domain" {
+                dom = tolower($2)
+                split(dom, parts, ".")
+                for (i = 2; i <= length(parts); i++) {
+                  subdomain = ""
+                  for (j = i; j <= length(parts); j++) subdomain = subdomain parts[j] (j < length(parts) ? "." : "")
+                  if (suffix[subdomain]) next
+                }
+              }
+              { print $0 }
+            ' "$file" | sort -fu > tmp && mv tmp "$file"
           done
 
-      - name: Convert rules to Mihomo format
+      - name: Convert to Mihomo Format
+        if: steps.check.outputs.changes == 'true'
         run: |
-          echo "Converting Shadowrocket rules to Mihomo..."
           for type in direct proxy reject; do
             sed 's/^URL-REGEX/^DOMAIN-REGEX/' "shadowrocket/${type}.list" > "mihomo/${type}.list"
           done
 
-      - name: Commit and Push changes
+      - name: Commit and Push
+        if: steps.check.outputs.changes == 'true'
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
+          git config user.name github-actions[bot]
+          git config user.email github-actions[bot]@users.noreply.github.com
+          git pull --rebase || exit 0
           git add shadowrocket/*.list mihomo/*.list
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Update rule lists - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            git push
-          fi
+          git diff --cached --quiet || git commit -m "Update rule lists - $(date -u '+%Y-%m-%d %H:%M:%S UTC')" && git push
+
+      - name: No Changes
+        if: steps.check.outputs.changes == 'false'
+        run: echo "No changes detected. Skipping."
