@@ -2,157 +2,152 @@ import os
 import re
 import requests
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
-class TrieNode:
-    def __init__(self):
-        self.children = {}
-        self.is_end = False
-        self.rule = None
+# Constants
+BASE_URL = "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master"
+SOURCES = {
+    "direct": f"{BASE_URL}/sr_direct_list.module",
+    "proxy": f"{BASE_URL}/sr_proxy_list.module",
+    "reject": f"{BASE_URL}/sr_reject_list.module",
+}
+TYPES = ["direct", "proxy", "reject"]
+CACHE_DIR = ".github/cache"
 
-class Trie:
-    def __init__(self):
-        self.root = TrieNode()
+# Ensure cache directory exists
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-    def insert(self, domain, rule):
-        node = self.root
-        parts = domain.split('.')[::-1]
-        for part in parts:
-            if part not in node.children:
-                node.children[part] = TrieNode()
-            node = node.children[part]
-        node.is_end = True
-        node.rule = rule
-
-    def is_covered(self, domain):
-        node = self.root
-        parts = domain.split('.')[::-1]
-        for part in parts:
-            if part not in node.children:
-                return False
-            node = node.children[part]
-            if node.is_end:
-                print(f"DEBUG: {domain} covered by {node.rule}")
-                return True
-        return node.is_end
-
-def deduplicate_rules(rules):
-    by_type = defaultdict(list)
-    for rule in rules:
-        if not rule.strip() or rule.startswith('#'):
-            continue
-        rule_type, value = rule.split(',', 1)[0], rule.split(',', 1)[1]
-        by_type[rule_type].append((value, rule))
-
-    final_rules = set()
-    trie = Trie()
-    regexes = []
-
-    # 处理 DOMAIN-SUFFIX
-    if "DOMAIN-SUFFIX" in by_type:
-        for value, rule in by_type["DOMAIN-SUFFIX"]:
-            trie.insert(value, rule)
-            final_rules.add(rule)
-
-    # 处理 DOMAIN
-    if "DOMAIN" in by_type:
-        for value, rule in by_type["DOMAIN"]:
-            if not trie.is_covered(value):
-                final_rules.add(rule)
-            else:
-                print(f"DEBUG: Skipping {rule} as it's covered by a DOMAIN-SUFFIX")
-
-    # 处理 URL-REGEX
-    if "URL-REGEX" in by_type:
-        regexes = [(value, rule, re.compile(value)) for value, rule in by_type["URL-REGEX"]]
-        for value, rule, _ in regexes:
-            final_rules.add(rule)
-
-    # 过滤被 URL-REGEX 覆盖的规则
-    if regexes:
-        filtered_rules = set()
-        for rule in final_rules:
-            rule_type, value = rule.split(',', 1)[0], rule.split(',', 1)[1]
-            covered = False
-            if rule_type in ["DOMAIN", "DOMAIN-SUFFIX"]:
-                for _, regex_rule, regex in regexes:
-                    test_value = value if rule_type == "DOMAIN" else f"x.{value}"
-                    if regex.match(test_value):
-                        covered = True
-                        print(f"DEBUG: {rule} covered by {regex_rule}")
-                        break
-            if not covered:
-                filtered_rules.add(rule)
-        final_rules = filtered_rules
-
-    # 添加其他类型
-    for rule_type in by_type:
-        if rule_type not in ["DOMAIN", "DOMAIN-SUFFIX", "URL-REGEX"]:
-            final_rules.update(rule for _, rule in by_type[rule_type])
-
-    print(f"DEBUG: Final rules count: {len(final_rules)}")
-    return list(final_rules)
-
-# 其余函数保持不变
-def download_file(url):
+def fetch_url(url):
+    cache_file = os.path.join(CACHE_DIR, url.replace('/', '_').replace(':', '_'))
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        print(f"DEBUG: Successfully downloaded {url}")
-        return response.text.splitlines()
+        content = response.text
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return content
     except Exception as e:
-        print(f"DEBUG: Failed to download {url}: {e}")
-        return []
+        print(f"Failed to fetch {url}: {e}")
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                return f.read()
+        return ""
 
-def add_no_resolve(rule):
-    if re.match(r"^(IP-CIDR|IP-ASN),", rule) and "no-resolve" not in rule:
+def parse_rules(text):
+    rules = defaultdict(list)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '[Rule]' in line:
+            continue
+        rule = line.split(',', 1)[0]  # Remove policy (e.g., ,DIRECT)
+        if rule.startswith(('DOMAIN', 'DOMAIN-SUFFIX', 'URL-REGEX', 'IP-CIDR', 'IP-ASN')):
+            rules[rule.split(',', 1)[0]].append(rule)
+    return rules
+
+def deduplicate_rules(rules):
+    # Sort by precedence: URL-REGEX > DOMAIN-SUFFIX > DOMAIN
+    precedence = {'URL-REGEX': 3, 'DOMAIN-SUFFIX': 2, 'DOMAIN': 1}
+    domain_rules = set()
+    suffix_rules = set()
+    regex_rules = set()
+    other_rules = []
+
+    for rule_type, rule_list in rules.items():
+        if rule_type == 'DOMAIN':
+            for rule in rule_list:
+                domain = rule.split(',', 1)[1]
+                domain_rules.add((rule, domain))
+        elif rule_type == 'DOMAIN-SUFFIX':
+            for rule in rule_list:
+                suffix = rule.split(',', 1)[1]
+                suffix_rules.add((rule, suffix))
+        elif rule_type == 'URL-REGEX':
+            for rule in rule_list:
+                regex = rule.split(',', 1)[1]
+                regex_rules.add((rule, regex))
+        else:
+            other_rules.extend(rule_list)
+
+    # Deduplicate DOMAIN against DOMAIN-SUFFIX
+    filtered_domains = set()
+    for rule, domain in domain_rules:
+        if not any(domain.endswith(suffix) for _, suffix in suffix_rules):
+            filtered_domains.add(rule)
+
+    # Deduplicate DOMAIN and DOMAIN-SUFFIX against URL-REGEX (simplified check)
+    final_domains = set()
+    final_suffixes = set()
+    for rule in filtered_domains:
+        domain = rule.split(',', 1)[1]
+        if not any(re.search(regex, domain) for _, regex in regex_rules):
+            final_domains.add(rule)
+    for rule, suffix in suffix_rules:
+        if not any(re.search(regex, suffix) for _, regex in regex_rules):
+            final_suffixes.add(rule)
+
+    # Combine and sort
+    all_rules = list(final_domains) + list(final_suffixes) + [r[0] for r in regex_rules] + other_rules
+    return sorted(all_rules, key=lambda x: x.split(',', 1)[1] if ',' in x else x)
+
+def append_no_resolve(rule):
+    if rule.startswith(('IP-CIDR', 'IP-ASN')) and ',no-resolve' not in rule:
         return f"{rule},no-resolve"
     return rule
 
-def process_rule_type(rule_type, base_url, custom_url_file, custom_list_file, output_dir):
-    base_lines = download_file(base_url)
-    rule_start = base_lines.index("[Rule]") if "[Rule]" in base_lines else 0
-    rules = [line.rsplit(f",{rule_type.upper()}", 1)[0] for line in base_lines[rule_start + 1:] if line.strip()]
+def convert_to_mihomo(rule):
+    if rule.startswith('URL-REGEX'):
+        regex = rule.split(',', 1)[1]
+        # Simplify: assume URL-REGEX is domain-like; adjust as needed
+        domain_regex = regex.replace('^https?://', '').replace('.*', '')
+        return f"DOMAIN-REGEX,{domain_regex}"
+    return rule
 
-    custom_urls = []
-    if os.path.exists(custom_url_file):
-        with open(custom_url_file, 'r', encoding='utf-8') as f:
-            custom_urls = [line.strip() for line in f if line.strip()]
-    with ThreadPoolExecutor() as executor:
-        custom_rules = sum(executor.map(download_file, custom_urls), [])
-    rules.extend(custom_rules)
+def process_type(rule_type):
+    # Step 1: Fetch and clean base rules
+    base_content = fetch_url(SOURCES[rule_type])
+    base_rules = parse_rules(base_content)
 
-    rules = deduplicate_rules(rules)
+    # Step 2: Fetch and parse URL rules
+    url_file = f"custom/{rule_type}-url.list"
+    url_rules = defaultdict(list)
+    if os.path.exists(url_file):
+        with open(url_file, 'r', encoding='utf-8') as f:
+            urls = [line.strip() for line in f if line.strip()]
+        for url in urls:
+            content = fetch_url(url)
+            for rule_type, rules in parse_rules(content).items():
+                url_rules[rule_type].extend(rules)
 
-    if os.path.exists(custom_list_file):
-        with open(custom_list_file, 'r', encoding='utf-8') as f:
-            rules.extend(line.strip() for line in f if line.strip())
+    # Step 3: Load custom rules
+    custom_file = f"custom/{rule_type}.list"
+    custom_rules = defaultdict(list)
+    if os.path.exists(custom_file):
+        with open(custom_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+            custom_rules = parse_rules(content)
 
-    rules = [add_no_resolve(rule) for rule in rules]
-    rules.sort()
+    # Step 4: Merge and deduplicate (custom > url > base)
+    merged_rules = defaultdict(list)
+    for rule_type in base_rules:
+        merged_rules[rule_type] = base_rules[rule_type] + url_rules[rule_type] + custom_rules[rule_type]
+    deduped_rules = deduplicate_rules(merged_rules)
 
-    os.makedirs(output_dir, exist_ok=True)
-    with open(f"{output_dir}/{rule_type}.list", 'w', encoding='utf-8') as f:
-        f.write("\n".join(rules) + "\n")
+    # Step 5: Add no-resolve and write Shadowrocket file
+    final_rules = [append_no_resolve(rule) for rule in deduped_rules]
+    os.makedirs('shadowrocket', exist_ok=True)
+    with open(f"shadowrocket/{rule_type}.list", 'w', encoding='utf-8') as f:
+        f.write("# Generated by GitHub Actions\n")
+        f.write('\n'.join(final_rules) + '\n')
 
-    mihomo_rules = [line.replace("URL-REGEX", "DOMAIN-REGEX") for line in rules]
+    # Step 6: Convert to mihomo and write
+    mihomo_rules = [convert_to_mihomo(rule) for rule in final_rules]
+    os.makedirs('mihomo', exist_ok=True)
     with open(f"mihomo/{rule_type}.list", 'w', encoding='utf-8') as f:
-        f.write("\n".join(mihomo_rules) + "\n")
+        f.write("# Generated by GitHub Actions\n")
+        f.write('\n'.join(mihomo_rules) + '\n')
 
 def main():
-    base_urls = {
-        "direct": "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_direct_list.module",
-        "proxy": "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_proxy_list.module",
-        "reject": "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_reject_list.module"
-    }
-    for rule_type in ["direct", "proxy", "reject"]:
-        process_rule_type(
-            rule_type,
-            base_urls[rule_type],
-            f"custom/{rule_type}-url.list",
-            f"custom/{rule_type}.list",
-            "shadowrocket"
-        )
+    for rule_type in TYPES:
+        process_type(rule_type)
 
-if __name__ == "__main__":
+if name == "__main__":
     main()
