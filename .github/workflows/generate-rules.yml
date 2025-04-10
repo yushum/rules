@@ -1,138 +1,98 @@
-name: Generate Rules
-
-permissions:
-  contents: write
+name: Generate Custom Rules
 
 on:
+  workflow_dispatch: # Allow manual trigger
   schedule:
+    # Runs daily at 23:00 UTC (7:00 AM Beijing Time / UTC+8)
+    # Note: Cron times are UTC.
     - cron: '0 23 * * *'
-  workflow_dispatch:
+  push:
+    branches:
+      - main # Or your default branch name (e.g., master)
+    paths:
+      # Trigger if custom rules, the script, or the workflow itself change
+      - 'custom/**'
+      - '.github/scripts/generate_rules.py'
+      - '.github/workflows/generate-rules.yml'
 
 jobs:
-  generate-rules:
+  build-rules:
     runs-on: ubuntu-latest
+    # Grant permissions for the workflow to commit back to the repository
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v4
         with:
-          fetch-depth: 2
+          python-version: '3.11' # Specify a recent Python version
+          cache: 'pip' # Cache pip dependencies
 
-      - name: Cache previous remote files
-        id: cache-remote
-        uses: actions/cache@v3
-        with:
-          path: |
-            old_direct.tmp
-            old_proxy.tmp
-            old_reject.tmp
-            old_steamcn.tmp
-          key: remote-files-${{ github.run_id }}
-          restore-keys: remote-files-
+      - name: Install dependencies
+        run: pip install requests
 
-      - name: Check for changes in custom files and remote sources
-        id: check-changes
-        run: |
-          CUSTOM_CHANGED=false
-          if [ -d custom ] && git diff --name-only HEAD^ HEAD -- custom/*.list | grep -q .; then
-            CUSTOM_CHANGED=true
-            echo "Custom files have changed"
-          fi
-          declare -A urls=(
-            [direct]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_direct_list.module"
-            [proxy]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_proxy_list.module"
-            [reject]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_reject_list.module"
-            [steamcn]="https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list"
-          )
-          REMOTE_CHANGED=false
-          for type in "${!urls[@]}"; do
-            curl -s -I "${urls[$type]}" -o headers.txt
-            ETAG=$(grep -i "ETag" headers.txt | cut -d'"' -f2)
-            LAST_MODIFIED=$(grep -i "Last-Modified" headers.txt | cut -d' ' -f2-)
-            echo "${type}_etag=$ETAG" >> $GITHUB_OUTPUT
-            echo "${type}_last_modified=$LAST_MODIFIED" >> $GITHUB_OUTPUT
-            if [ -f "old_${type}.tmp" ]; then
-              OLD_HASH=$(sha256sum "old_${type}.tmp" | cut -d' ' -f1)
-              curl -s "${urls[$type]}" -o "new_${type}.tmp"
-              NEW_HASH=$(sha256sum "new_${type}.tmp" | cut -d' ' -f1)
-              if [ "$OLD_HASH" != "$NEW_HASH" ]; then
-                REMOTE_CHANGED=true
-                echo "${urls[$type]} has changed"
-              fi
-              mv "new_${type}.tmp" "old_${type}.tmp"
-            else
-              curl -s "${urls[$type]}" -o "old_${type}.tmp"
-              REMOTE_CHANGED=true
-              echo "No previous ${type} file found"
-            fi
-          done
-          if [ "$CUSTOM_CHANGED" = true ] || [ "$REMOTE_CHANGED" = true ]; then
-            echo "changes_detected=true" >> $GITHUB_OUTPUT
-          else
-            echo "changes_detected=false" >> $GITHUB_OUTPUT
-          fi
-        continue-on-error: true
+      - name: Generate rule lists
+        run: python .github/scripts/generate_rules.py # Execute the script
 
-      - name: Exit if no changes or check failed
-        if: steps.check-changes.outputs.changes_detected != 'true'
+      - name: Commit and push changes
+        env:
+          # Use the GitHub Actions bot user for commits
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          COMMIT_MSG: "Update rule lists [skip ci]" # Add [skip ci] to prevent triggering loops if workflow also runs on push
         run: |
-          if [ "${{ steps.check-changes.outcome }}" = "failure" ]; then
-            echo "Change detection failed, assuming changes to be safe"
-            exit 1
-          else
-            echo "No changes detected, skipping build"
-            exit 0
-          fi
-      - name: Prepare folders
-        run: mkdir -p shadowrocket mihomo custom
+          git config --global user.name "${GIT_AUTHOR_NAME}"
+          git config --global user.email "${GIT_AUTHOR_EMAIL}"
 
-      - name: Process rules
-        run: |
-          declare -A urls=(
-            [direct]="sr_direct_list.module"
-            [proxy]="sr_proxy_list.module"
-            [reject]="sr_reject_list.module"
-          )
-          for type in "${!urls[@]}"; do
-            curl -s "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" -o "temp.module"
-            sed '1,/^\[Rule\]$/d' temp.module | \
-              sed "s/,${type^^}$//" | \
-              sed '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' > "shadowrocket/${type}.list"
-            rm temp.module
-          done
-          curl -s https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list -o steamcn.list
-          grep -v '^#' steamcn.list >> shadowrocket/direct.list
-          sort -u shadowrocket/direct.list -o shadowrocket/direct.list
-          rm steamcn.list
-          for type in direct proxy reject; do
-            if [ -f "custom/${type}.list" ]; then
-              grep -v '^#' "custom/${type}.list" >> "shadowrocket/${type}.list"
-              sort -u "shadowrocket/${type}.list" -o "shadowrocket/${type}.list"
-            fi
-          done
-          for file in shadowrocket/*.list; do
-            grep "^DOMAIN-SUFFIX," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > suffixes.txt
-            grep "^DOMAIN," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > domains.txt
-            cp "$file" temp_file.txt
-            while read -r domain; do
-              if grep -q "^$domain$" suffixes.txt || grep -q "^.*\.$domain$" suffixes.txt; then
-                sed -i "/^DOMAIN,${domain}$/Id" temp_file.txt
-              fi
-            done < domains.txt
-            sort -fu temp_file.txt > "$file"
-            rm -f temp_file.txt suffixes.txt domains.txt
-          done
-          for type in direct proxy reject; do
-            sed 's/^URL-REGEX/^DOMAIN-REGEX/' "shadowrocket/${type}.list" > "mihomo/${type}.list"
-          done
-      - name: Commit and Push changes
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
+          # Add all potentially generated files in the output directories
           git add shadowrocket/*.list mihomo/*.list
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Update rule lists - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            git push
+
+          # Check if there are staged changes
+          if git diff --staged --quiet; then
+            echo "No changes detected in generated rule lists."
+            exit 0 # Exit successfully if no changes
+          fi
+
+          echo "Changes detected. Committing and pushing..."
+          # Use UTC date in commit message for consistency
+          git commit -m "${COMMIT_MSG} ($(date -u +'%Y-%m-%d %H:%M:%S %Z'))"
+
+          # Retry push with backoff and pull --rebase before retrying
+          retry_count=0
+          max_retries=3
+          push_success=false
+          until ${push_success} || [ $retry_count -eq $max_retries ]; do
+            retry_count=$((retry_count+1))
+            # Attempt push
+            if git push; then
+              push_success=true
+              echo "Changes pushed successfully."
+            else
+              echo "Push failed (Attempt ${retry_count}/${max_retries})..."
+              if [ $retry_count -lt $max_retries ]; then
+                 # Wait before retrying
+                 sleep $((5 * retry_count))
+                 echo "Pulling remote changes before retrying push..."
+                 # Pull remote changes (rebase strategy to avoid merge commits)
+                 if ! git pull --rebase --autostash; then
+                    echo "Pull failed. Aborting push retry."
+                    # Optional: Consider failing the job here or trying push one last time
+                    break # Exit the loop if pull fails
+                 fi
+              fi
+            fi
+          done
+
+          # Check if push ultimately failed
+          if ! ${push_success}; then
+            echo "Push failed after $max_retries retries."
+            # Optional: Reset the commit locally if push failed?
+            # git reset --hard HEAD~1
+            exit 1 # Fail the workflow if push fails
           fi
