@@ -33,6 +33,7 @@ jobs:
       - name: Check for changes
         id: check-changes
         run: |
+          set -eo pipefail
           CUSTOM_CHANGED=false
           if [ -d custom ] && git diff --name-only HEAD^ HEAD -- custom/*.list | grep -q .; then
             CUSTOM_CHANGED=true
@@ -48,7 +49,7 @@ jobs:
 
           REMOTE_CHANGED=false
           for type in "${!urls[@]}"; do
-            curl -s "${urls[$type]}" -o "new_${type}.tmp"
+            curl -s --max-time 15 --connect-timeout 5 "${urls[$type]}" -o "new_${type}.tmp" || { echo "Error fetching ${urls[$type]}, skipping"; continue; }
             if [ -f "old_${type}.tmp" ]; then
               if ! cmp -s "old_${type}.tmp" "new_${type}.tmp"; then
                 REMOTE_CHANGED=true
@@ -62,61 +63,67 @@ jobs:
           done
 
           if [ "$CUSTOM_CHANGED" = true ] || [ "$REMOTE_CHANGED" = true ]; then
-            echo "changes_detected=true" >> $GITHUB_OUTPUT
+            echo "changes_detected=true" >> "$GITHUB_OUTPUT"
           else
-            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            echo "changes_detected=false" >> "$GITHUB_OUTPUT"
           fi
-        continue-on-error: true
 
       - name: Exit if no changes
         if: steps.check-changes.outputs.changes_detected != 'true'
         run: |
-          if [ "${{ steps.check-changes.outcome }}" = "failure" ]; then
-            echo "Change detection failed, assuming changes to be safe"
-            exit 1
-          else
-            echo "No changes detected, skipping build"
-            exit 0
-          fi
+          echo "No changes detected, skipping build"
+          exit 0
 
       - name: Prepare folders
         run: mkdir -p shadowrocket mihomo custom
 
+      - name: Create tlds.txt
+        run: |
+          echo -e "com\ncn\norg\nnet\ncom.cn\norg.cn\nnet.cn\nedu\ngov\nio\nme\napp\ntv\ninfo\nco" > tlds.txt
+
       - name: Process rules
         run: |
+          set -eo pipefail
+          # 处理 shadowrocket 的 direct/proxy/reject 规则
           declare -A urls=(
             [direct]="sr_direct_list.module"
             [proxy]="sr_proxy_list.module"
             [reject]="sr_reject_list.module"
           )
           for type in "${!urls[@]}"; do
-            curl -s "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" -o "temp.module"
+            echo "Processing $type rules..."
+            curl -s --max-time 15 --connect-timeout 5 "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" -o "temp.module" || { echo "Error fetching ${urls[$type]}, skipping"; continue; }
             sed '1,/^\[Rule\]$/d' temp.module | \
               sed "s/,${type^^}$//" | \
               sed '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' > "shadowrocket/${type}.list"
             rm temp.module
+            echo "Finished processing $type rules."
           done
 
-          curl -s https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list | \
+          # 追加 SteamCN 规则到 direct 列表中，并排序去重
+          echo "Appending SteamCN rules..."
+          curl -s --max-time 15 --connect-timeout 5 https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list | \
             grep -v '^#' >> shadowrocket/direct.list
           sort -u shadowrocket/direct.list -o shadowrocket/direct.list
+          echo "Finished appending SteamCN rules."
 
+          # 处理 custom 规则
           for type in direct proxy reject; do
             if [ -f "custom/${type}.list" ]; then
+              echo "Appending custom $type rules..."
               grep -v '^#' "custom/${type}.list" >> "shadowrocket/${type}.list"
               sort -u "shadowrocket/${type}.list" -o "shadowrocket/${type}.list"
+              echo "Finished appending custom $type rules."
             fi
           done
 
           # 终极去重脚本
           for file in shadowrocket/*.list; do
+            echo "Deduplicating $file..."
             awk -F',' '
               BEGIN {
-                delete suffixes; delete domains; delete regexes; delete others;
-                # 定义常见顶级域（避免误判）
-                tlds["com"] = 1; tlds["cn"] = 1; tlds["org"] = 1; tlds["net"] = 1;
-                tlds["com.cn"] = 1; tlds["org.cn"] = 1; tlds["net.cn"] = 1;
-                tlds["edu"] = 1; tlds["gov"] = 1;
+                # 加载顶级域
+                while ((getline < "tlds.txt") > 0) tlds[tolower($0)] = 1;
               }
               /^DOMAIN-SUFFIX,/ {
                 suffix = tolower($2);
@@ -129,8 +136,9 @@ jobs:
                 next;
               }
               /^URL-REGEX,/ {
-                regex = $2;  # 保留原始正则表达式
-                regexes[regex] = $0;
+                regex = $2;
+                if ($0 ~ /# keep$/) keep_regexes[regex] = $0;
+                else regexes[regex] = $0;
                 next;
               }
               { others[$0] = 1; next; }
@@ -162,7 +170,6 @@ jobs:
                   keep = 1;
                   for (suffix in suffixes) {
                     if (!(suffix in tlds) && regex ~ "[.]" suffix "(/|$|[?])") {
-                      # 如果正则表达式完全匹配某个 suffix 且后接 /、结束或查询参数，则认为被覆盖
                       keep = 0; break;
                     }
                   }
@@ -172,21 +179,33 @@ jobs:
                 # 输出结果
                 for (suffix in filtered_suffixes) print filtered_suffixes[suffix];
                 for (domain in filtered_domains) print filtered_domains[domain];
+                for (regex in keep_regexes) print keep_regexes[regex];
                 for (regex in filtered_regexes) print filtered_regexes[regex];
                 for (other in others) print other;
               }
             ' "$file" | sort -u > temp_file.txt
             mv temp_file.txt "$file"
+            echo "Finished deduplicating $file."
           done
 
           # 生成 mihomo 规则
           for type in direct proxy reject; do
+            echo "Generating mihomo $type rules..."
             sed 's/^URL-REGEX/^DOMAIN-REGEX/' "shadowrocket/${type}.list" > "mihomo/${type}.list"
+            echo "Finished generating mihomo $type rules."
           done
+
+      - name: Set commit message
+        id: set-commit-msg
+        run: |
+          echo "COMMIT_MESSAGE=Update rule lists - $GITHUB_RUN_ID - $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
 
       - name: Commit and Push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update rule lists - ${{ github.run_id }} - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          file_pattern: 'shadowrocket/*.list mihomo/*.list'
+          commit_message: ${{ env.COMMIT_MESSAGE }}
+          file_pattern: '"shadowrocket/*.list" "mihomo/*.list"'
           skip_dirty_check: false
+
+      - name: Clean up temporary files
+        run: rm -f old_*.tmp tlds.txt
