@@ -5,7 +5,7 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 23 * * *'  # 每天 23:00 UTC
+    - cron: '0 23 * * *'
   workflow_dispatch:
 
 jobs:
@@ -27,30 +27,17 @@ jobs:
             old_proxy.tmp
             old_reject.tmp
             old_steamcn.tmp
-          key: remote-files
-          restore-keys: remote-files
+          key: remote-files-${{ github.run_id }}
+          restore-keys: remote-files-
 
-      - name: Check for changes
+      - name: Check for changes in custom files and remote sources
         id: check-changes
         run: |
-          trap 'echo "changes_detected=true" >> "$GITHUB_OUTPUT"; echo "Error in change detection, assuming changes" >&2' ERR
-          set -eo pipefail
-
-          # 检查 custom 文件变动
           CUSTOM_CHANGED=false
-          if [ -d custom ]; then
-            if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-              if git diff --name-only HEAD^ HEAD -- custom/*.list | grep -q .; then
-                CUSTOM_CHANGED=true
-                echo "Custom files have changed"
-              fi
-            else
-              CUSTOM_CHANGED=true
-              echo "No previous commit, assuming custom files changed"
-            fi
+          if [ -d custom ] && git diff --name-only HEAD^ HEAD -- custom/*.list | grep -q .; then
+            CUSTOM_CHANGED=true
+            echo "Custom files have changed"
           fi
-
-          # 拉取远程文件并比对
           declare -A urls=(
             [direct]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_direct_list.module"
             [proxy]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_proxy_list.module"
@@ -59,200 +46,93 @@ jobs:
           )
           REMOTE_CHANGED=false
           for type in "${!urls[@]}"; do
-            curl -s --max-time 15 --connect-timeout 5 "${urls[$type]}" -o "new_${type}.tmp" || { echo "Error fetching ${urls[$type]}, skipping"; continue; }
+            curl -s -I "${urls[$type]}" -o headers.txt
+            ETAG=$(grep -i "ETag" headers.txt | cut -d'"' -f2)
+            LAST_MODIFIED=$(grep -i "Last-Modified" headers.txt | cut -d' ' -f2-)
+            echo "${type}_etag=$ETAG" >> $GITHUB_OUTPUT
+            echo "${type}_last_modified=$LAST_MODIFIED" >> $GITHUB_OUTPUT
             if [ -f "old_${type}.tmp" ]; then
-              if ! cmp -s "old_${type}.tmp" "new_${type}.tmp"; then
+              OLD_HASH=$(sha256sum "old_${type}.tmp" | cut -d' ' -f1)
+              curl -s "${urls[$type]}" -o "new_${type}.tmp"
+              NEW_HASH=$(sha256sum "new_${type}.tmp" | cut -d' ' -f1)
+              if [ "$OLD_HASH" != "$NEW_HASH" ]; then
                 REMOTE_CHANGED=true
                 echo "${urls[$type]} has changed"
               fi
+              mv "new_${type}.tmp" "old_${type}.tmp"
             else
+              curl -s "${urls[$type]}" -o "old_${type}.tmp"
               REMOTE_CHANGED=true
               echo "No previous ${type} file found"
             fi
-            mv "new_${type}.tmp" "old_${type}.tmp"
           done
-
           if [ "$CUSTOM_CHANGED" = true ] || [ "$REMOTE_CHANGED" = true ]; then
-            echo "changes_detected=true" >> "$GITHUB_OUTPUT"
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
           else
-            echo "changes_detected=false" >> "$GITHUB_OUTPUT"
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
           fi
+        continue-on-error: true
 
-      - name: Exit if no changes
+      - name: Exit if no changes or check failed
         if: steps.check-changes.outputs.changes_detected != 'true'
         run: |
-          echo "No changes detected, skipping build"
-          exit 0
-
+          if [ "${{ steps.check-changes.outcome }}" = "failure" ]; then
+            echo "Change detection failed, assuming changes to be safe"
+            exit 1
+          else
+            echo "No changes detected, skipping build"
+            exit 0
+          fi
       - name: Prepare folders
         run: mkdir -p shadowrocket mihomo custom
 
-      - name: Process base rules
+      - name: Process rules
         run: |
-          set -eo pipefail
           declare -A urls=(
             [direct]="sr_direct_list.module"
             [proxy]="sr_proxy_list.module"
             [reject]="sr_reject_list.module"
           )
           for type in "${!urls[@]}"; do
-            echo "Downloading and cleaning base $type..."
-            curl -s --max-time 15 --connect-timeout 5 \
-              "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" \
-              -o temp.module
-            sed '1,/^\[Rule\]$/d' temp.module \
-              | sed "s/,${type^^}$//" \
-              | sed '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' \
-              > "shadowrocket/${type}.base"
+            curl -s "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" -o "temp.module"
+            sed '1,/^\[Rule\]$/d' temp.module | \
+              sed "s/,${type^^}$//" | \
+              sed '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' > "shadowrocket/${type}.list"
             rm temp.module
           done
-
-      - name: Download SteamCN for direct
-        run: |
-          curl -s --max-time 15 --connect-timeout 5 \
-            https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list \
-            | grep -v '^#' > steamcn.list
-
-      - name: Merge & dedupe for direct
-        run: |
-          # 1) Merge base + steamcn → direct.tmp
-          awk -F',' '
-          {
-            t=tolower($1); v=$2;
-            if (t=="domain") domains[v]=$0;
-            else if (t=="domain-suffix") suffixes[v]=$0;
-            else if (t=="url-regex") regexes[v]=$0;
-          }
-          END {
-            # (1) 保留所有 URL-REGEX
-            for (r in regexes) print regexes[r];
-            # (2) DOMAIN-SUFFIX：去重 + 去掉被更通用后缀或任何 regex 覆盖的
-            for (s in suffixes) {
-              esc_s=s; gsub(/\./,"\\\\.",esc_s);
-              covered=0;
-              # 后缀 vs 后缀
-              for (t in suffixes) {
-                if (t!=s && (s==t || s~("[.]"+t"$"))) { covered=1; break; }
-              }
-              # 后缀 vs 正则
-              if (!covered) {
-                for (r in regexes) if (index(r,esc_s)>0) { covered=1; break; }
-              }
-              if (!covered) print suffixes[s];
-            }
-            # (3) DOMAIN：去掉被任何后缀或 regex 覆盖的
-            for (d in domains) {
-              covered=0;
-              for (s in suffixes) {
-                if (d==s || d~("[.]"+s"$")) { covered=1; break; }
-              }
-              if (!covered) {
-                esc_d=d; gsub(/\./,"\\\\.",esc_d);
-                for (r in regexes) if (index(r,esc_d)>0) { covered=1; break; }
-              }
-              if (!covered) print domains[d];
-            }
-          }
-          ' shadowrocket/direct.base steamcn.list > shadowrocket/direct.tmp
-
-          # 2) Merge tmp + custom/direct → direct.list
-          if [ -f custom/direct.list ]; then
-            awk -F',' '
-            {
-              t=tolower($1); v=$2;
-              if (t=="domain") domains[v]=$0;
-              else if (t=="domain-suffix") suffixes[v]=$0;
-              else if (t=="url-regex") regexes[v]=$0;
-            }
-            END {
-              for (r in regexes) print regexes[r];
-              for (s in suffixes) {
-                esc_s=s; gsub(/\./,"\\\\.",esc_s);
-                covered=0;
-                for (t in suffixes) {
-                  if (t!=s && (s==t || s~("[.]"+t"$"))) { covered=1; break; }
-                }
-                if (!covered) {
-                  for (r in regexes) if (index(r,esc_s)>0) { covered=1; break; }
-                }
-                if (!covered) print suffixes[s];
-              }
-              for (d in domains) {
-                covered=0;
-                for (s in suffixes) {
-                  if (d==s || d~("[.]"+s"$")) { covered=1; break; }
-                }
-                if (!covered) {
-                  esc_d=d; gsub(/\./,"\\\\.",esc_d);
-                  for (r in regexes) if (index(r,esc_d)>0) { covered=1; break; }
-                }
-                if (!covered) print domains[d];
-              }
-            }
-            ' shadowrocket/direct.tmp custom/direct.list > shadowrocket/direct.list
-          else
-            mv shadowrocket/direct.tmp shadowrocket/direct.list
-          fi
-
-      - name: Merge & dedupe for proxy/reject
-        run: |
-          for type in proxy reject; do
-            if [ -f custom/${type}.list ]; then
-              awk -F',' '
-              {
-                t=tolower($1); v=$2;
-                if (t=="domain") domains[v]=$0;
-                else if (t=="domain-suffix") suffixes[v]=$0;
-                else if (t=="url-regex") regexes[v]=$0;
-              }
-              END {
-                for (r in regexes) print regexes[r];
-                for (s in suffixes) {
-                  esc_s=s; gsub(/\./,"\\\\.",esc_s);
-                  covered=0;
-                  for (t in suffixes) {
-                    if (t!=s && (s==t || s~("[.]"+t"$"))) { covered=1; break; }
-                  }
-                  if (!covered) {
-                    for (r in regexes) if (index(r,esc_s)>0) { covered=1; break; }
-                  }
-                  if (!covered) print suffixes[s];
-                }
-                for (d in domains) {
-                  covered=0;
-                  for (s in suffixes) {
-                    if (d==s || d~("[.]"+s"$")) { covered=1; break; }
-                  }
-                  if (!covered) {
-                    esc_d=d; gsub(/\./,"\\\\.",esc_d);
-                    for (r in regexes) if (index(r,esc_d)>0) { covered=1; break; }
-                  }
-                  if (!covered) print domains[d];
-                }
-              }
-              ' shadowrocket/${type}.base custom/${type}.list > shadowrocket/${type}.list
-            else
-              cp shadowrocket/${type}.base shadowrocket/${type}.list
+          curl -s https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list -o steamcn.list
+          grep -v '^#' steamcn.list >> shadowrocket/direct.list
+          sort -u shadowrocket/direct.list -o shadowrocket/direct.list
+          rm steamcn.list
+          for type in direct proxy reject; do
+            if [ -f "custom/${type}.list" ]; then
+              grep -v '^#' "custom/${type}.list" >> "shadowrocket/${type}.list"
+              sort -u "shadowrocket/${type}.list" -o "shadowrocket/${type}.list"
             fi
           done
-
-      - name: Generate mihomo lists
-        run: |
-          for type in direct proxy reject; do
-            sed 's/^URL-REGEX/^DOMAIN-REGEX/' shadowrocket/${type}.list > mihomo/${type}.list
+          for file in shadowrocket/*.list; do
+            grep "^DOMAIN-SUFFIX," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > suffixes.txt
+            grep "^DOMAIN," "$file" | cut -d',' -f2 | tr '[:upper:]' '[:lower:]' > domains.txt
+            cp "$file" temp_file.txt
+            while read -r domain; do
+              if grep -q "^$domain$" suffixes.txt || grep -q "^.*\.$domain$" suffixes.txt; then
+                sed -i "/^DOMAIN,${domain}$/Id" temp_file.txt
+              fi
+            done < domains.txt
+            sort -fu temp_file.txt > "$file"
+            rm -f temp_file.txt suffixes.txt domains.txt
           done
-
-      - name: Set commit message
-        id: set-commit-msg
-        run: |
-          echo "COMMIT_MESSAGE=Update rule lists - $GITHUB_RUN_ID - $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
-
+          for type in direct proxy reject; do
+            sed 's/^URL-REGEX/^DOMAIN-REGEX/' "shadowrocket/${type}.list" > "mihomo/${type}.list"
+          done
       - name: Commit and Push changes
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: ${{ env.COMMIT_MESSAGE }}
-          file_pattern: 'shadowrocket/*.list mihomo/*.list'
-          skip_dirty_check: false
-
-      - name: Clean up temporary files
-        run: rm -f old_*.tmp steamcn.list shadowrocket/*.base
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add shadowrocket/*.list mihomo/*.list
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update rule lists - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            git push
+          fi
