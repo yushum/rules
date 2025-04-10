@@ -44,7 +44,6 @@ def process_rules(lines):
     """处理规则，去除注释和策略，添加 no-resolve"""
     rules = []
     in_rule_section = False
-    режис
 
     for line in lines:
         line = line.strip()
