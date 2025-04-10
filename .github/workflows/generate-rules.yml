@@ -36,7 +36,7 @@ jobs:
           trap 'echo "changes_detected=true" >> "$GITHUB_OUTPUT"; echo "Error in change detection, assuming changes" >&2' ERR
           set -eo pipefail
 
-          # 1) 检查 custom 目录文件变动
+          # 检查 custom 文件变动
           CUSTOM_CHANGED=false
           if [ -d custom ]; then
             if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
@@ -50,7 +50,7 @@ jobs:
             fi
           fi
 
-          # 2) 拉取远程文件并比对
+          # 拉取远程文件并比对
           declare -A urls=(
             [direct]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_direct_list.module"
             [proxy]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_proxy_list.module"
@@ -59,15 +59,15 @@ jobs:
           )
           REMOTE_CHANGED=false
           for type in "${!urls[@]}"; do
-            curl -s --max-time 15 --connect-timeout 5 "${urls[$type]}" -o "new_${type}.tmp" || continue
+            curl -s --max-time 15 --connect-timeout 5 "${urls[$type]}" -o "new_${type}.tmp" || { echo "Error fetching ${urls[$type]}, skipping"; continue; }
             if [ -f "old_${type}.tmp" ]; then
               if ! cmp -s "old_${type}.tmp" "new_${type}.tmp"; then
                 REMOTE_CHANGED=true
-                echo "${type} remote changed"
+                echo "${urls[$type]} has changed"
               fi
             else
               REMOTE_CHANGED=true
-              echo "No previous ${type} file"
+              echo "No previous ${type} file found"
             fi
             mv "new_${type}.tmp" "old_${type}.tmp"
           done
@@ -96,116 +96,141 @@ jobs:
             [reject]="sr_reject_list.module"
           )
           for type in "${!urls[@]}"; do
+            echo "Downloading and cleaning base $type..."
             curl -s --max-time 15 --connect-timeout 5 \
               "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" \
-              | sed '1,/^\[Rule\]$/d' \
-                    -e "s/,${type^^}$//" \
-                    -e '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' \
+              -o temp.module
+            sed '1,/^\[Rule\]$/d' temp.module \
+              | sed "s/,${type^^}$//" \
+              | sed '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' \
               > "shadowrocket/${type}.base"
+            rm temp.module
           done
 
-      - name: Merge & dedupe for direct (1 AWK 调用)
+      - name: Download SteamCN for direct
         run: |
-          # 合并 shadowrocket/direct.base + SteamCN + custom/direct.list
+          curl -s --max-time 15 --connect-timeout 5 \
+            https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list \
+            | grep -v '^#' > steamcn.list
+
+      - name: Merge & dedupe for direct
+        run: |
+          # 1) Merge base + steamcn → direct.tmp
+          awk -F',' '
+          {
+            t=tolower($1); v=$2;
+            if (t=="domain") domains[v]=$0;
+            else if (t=="domain-suffix") suffixes[v]=$0;
+            else if (t=="url-regex") regexes[v]=$0;
+          }
+          END {
+            # (1) 保留所有 URL-REGEX
+            for (r in regexes) print regexes[r];
+            # (2) DOMAIN-SUFFIX：去重 + 去掉被更通用后缀或任何 regex 覆盖的
+            for (s in suffixes) {
+              esc_s=s; gsub(/\./,"\\\\.",esc_s);
+              covered=0;
+              # 后缀 vs 后缀
+              for (t in suffixes) {
+                if (t!=s && (s==t || s~("[.]"+t"$"))) { covered=1; break; }
+              }
+              # 后缀 vs 正则
+              if (!covered) {
+                for (r in regexes) if (index(r,esc_s)>0) { covered=1; break; }
+              }
+              if (!covered) print suffixes[s];
+            }
+            # (3) DOMAIN：去掉被任何后缀或 regex 覆盖的
+            for (d in domains) {
+              covered=0;
+              for (s in suffixes) {
+                if (d==s || d~("[.]"+s"$")) { covered=1; break; }
+              }
+              if (!covered) {
+                esc_d=d; gsub(/\./,"\\\\.",esc_d);
+                for (r in regexes) if (index(r,esc_d)>0) { covered=1; break; }
+              }
+              if (!covered) print domains[d];
+            }
+          }
+          ' shadowrocket/direct.base steamcn.list > shadowrocket/direct.tmp
+
+          # 2) Merge tmp + custom/direct → direct.list
           if [ -f custom/direct.list ]; then
             awk -F',' '
-            # 1) 读所有输入，分类存储
-            { t=tolower($1); v=$2;
-              if (t=="domain")         domains[v]=$0;
+            {
+              t=tolower($1); v=$2;
+              if (t=="domain") domains[v]=$0;
               else if (t=="domain-suffix") suffixes[v]=$0;
-              else if (t=="url-regex")     regexes[v]=$0;
+              else if (t=="url-regex") regexes[v]=$0;
             }
             END {
-              # A. 保留所有 URL-REGEX
               for (r in regexes) print regexes[r];
-              # B. DOMAIN-SUFFIX：去重 + 去掉被更通用后缀或任何 regex 覆盖的
               for (s in suffixes) {
-                esc=s; gsub(/\./,"\\\\.",esc);
-                cov=0;
-                # B1. 后缀 vs 后缀
-                for (t in suffixes) if (t!=s && (s==t || s~("[.]"+t"$"))) { cov=1; break }
-                # B2. 后缀 vs 正则
-                if (!cov) for (r in regexes) if (index(r,esc)>0) { cov=1; break }
-                if (!cov) print suffixes[s];
-              }
-              # C. DOMAIN：去掉被任何后缀或 regex 覆盖的
-              for (d in domains) {
-                cov=0;
-                for (s in suffixes) if (d==s || d~("[.]"+s"$")) { cov=1; break }
-                if (!cov) {
-                  escd=d; gsub(/\./,"\\\\.",escd);
-                  for (r in regexes) if (index(r,escd)>0) { cov=1; break }
+                esc_s=s; gsub(/\./,"\\\\.",esc_s);
+                covered=0;
+                for (t in suffixes) {
+                  if (t!=s && (s==t || s~("[.]"+t"$"))) { covered=1; break; }
                 }
-                if (!cov) print domains[d];
+                if (!covered) {
+                  for (r in regexes) if (index(r,esc_s)>0) { covered=1; break; }
+                }
+                if (!covered) print suffixes[s];
+              }
+              for (d in domains) {
+                covered=0;
+                for (s in suffixes) {
+                  if (d==s || d~("[.]"+s"$")) { covered=1; break; }
+                }
+                if (!covered) {
+                  esc_d=d; gsub(/\./,"\\\\.",esc_d);
+                  for (r in regexes) if (index(r,esc_d)>0) { covered=1; break; }
+                }
+                if (!covered) print domains[d];
               }
             }
-            ' shadowrocket/direct.base <(curl -s --max-time 15 --connect-timeout 5 \
-                 https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list \
-                 | grep -v '^#') custom/direct.list \
-            > shadowrocket/direct.list
+            ' shadowrocket/direct.tmp custom/direct.list > shadowrocket/direct.list
           else
-            awk -F',' '
-            { t=tolower($1); v=$2;
-              if (t=="domain")         domains[v]=$0;
-              else if (t=="domain-suffix") suffixes[v]=$0;
-              else if (t=="url-regex")     regexes[v]=$0;
-            }
-            END {
-              for (r in regexes) print regexes[r];
-              for (s in suffixes) {
-                esc=s; gsub(/\./,"\\\\.",esc);
-                cov=0;
-                for (t in suffixes) if (t!=s && (s==t || s~("[.]"+t"$"))) { cov=1; break }
-                if (!cov) for (r in regexes) if (index(r,esc)>0) { cov=1; break }
-                if (!cov) print suffixes[s];
-              }
-              for (d in domains) {
-                cov=0;
-                for (s in suffixes) if (d==s || d~("[.]"+s"$")) { cov=1; break }
-                if (!cov) {
-                  escd=d; gsub(/\./,"\\\\.",escd);
-                  for (r in regexes) if (index(r,escd)>0) { cov=1; break }
-                }
-                if (!cov) print domains[d];
-              }
-            }
-            ' shadowrocket/direct.base <(curl -s --max-time 15 --connect-timeout 5 \
-                 https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list \
-                 | grep -v '^#') \
-            > shadowrocket/direct.list
+            mv shadowrocket/direct.tmp shadowrocket/direct.list
           fi
 
-      - name: Merge & dedupe for proxy & reject (各 1 AWK 调用)
+      - name: Merge & dedupe for proxy/reject
         run: |
           for type in proxy reject; do
             if [ -f custom/${type}.list ]; then
               awk -F',' '
-              { t=tolower($1); v=$2;
-                if (t=="domain")         domains[v]=$0;
+              {
+                t=tolower($1); v=$2;
+                if (t=="domain") domains[v]=$0;
                 else if (t=="domain-suffix") suffixes[v]=$0;
-                else if (t=="url-regex")     regexes[v]=$0;
+                else if (t=="url-regex") regexes[v]=$0;
               }
               END {
                 for (r in regexes) print regexes[r];
                 for (s in suffixes) {
-                  esc=s; gsub(/\./,"\\\\.",esc);
-                  cov=0;
-                  for (t in suffixes) if (t!=s && (s==t || s~("[.]"+t"$"))) { cov=1; break }
-                  if (!cov) for (r in regexes) if (index(r,esc)>0) { cov=1; break }
-                  if (!cov) print suffixes[s];
+                  esc_s=s; gsub(/\./,"\\\\.",esc_s);
+                  covered=0;
+                  for (t in suffixes) {
+                    if (t!=s && (s==t || s~("[.]"+t"$"))) { covered=1; break; }
+                  }
+                  if (!covered) {
+                    for (r in regexes) if (index(r,esc_s)>0) { covered=1; break; }
+                  }
+                  if (!covered) print suffixes[s];
                 }
                 for (d in domains) {
-                  cov=0;
-                  for (s in suffixes) if (d==s || d~("[.]"+s"$")) { cov=1; break }
-                  if (!cov) {
-                    escd=d; gsub(/\./,"\\\\.",escd);
-                    for (r in regexes) if (index(r,escd)>0) { cov=1; break }
+                  covered=0;
+                  for (s in suffixes) {
+                    if (d==s || d~("[.]"+s"$")) { covered=1; break; }
                   }
-                  if (!cov) print domains[d];
+                  if (!covered) {
+                    esc_d=d; gsub(/\./,"\\\\.",esc_d);
+                    for (r in regexes) if (index(r,esc_d)>0) { covered=1; break; }
+                  }
+                  if (!covered) print domains[d];
                 }
               }
-              ' shadowrocket/${type}.base custom/${type}.list \
-              > shadowrocket/${type}.list
+              ' shadowrocket/${type}.base custom/${type}.list > shadowrocket/${type}.list
             else
               cp shadowrocket/${type}.base shadowrocket/${type}.list
             fi
@@ -230,4 +255,4 @@ jobs:
           skip_dirty_check: false
 
       - name: Clean up temporary files
-        run: rm -f old_*.tmp shadowrocket/*.base
+        run: rm -f old_*.tmp steamcn.list shadowrocket/*.base
