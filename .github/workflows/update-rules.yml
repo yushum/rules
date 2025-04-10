@@ -5,6 +5,9 @@ on:
     - cron: '0 23 * * *' # 北京时间 7:00 (UTC 23:00)
   workflow_dispatch: # 允许手动触发
 
+permissions:
+  contents: write # 显式声明写权限
+
 jobs:
   update-rules:
     runs-on: ubuntu-latest
@@ -12,7 +15,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }} # 确保 checkout 使用 token
+          token: ${{ secrets.GITHUB_TOKEN }} # 使用 GITHUB_TOKEN 检出
 
       - name: Set up Python
         uses: actions/setup-python@v5
