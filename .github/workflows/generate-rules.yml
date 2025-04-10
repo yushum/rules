@@ -27,17 +27,27 @@ jobs:
             old_proxy.tmp
             old_reject.tmp
             old_steamcn.tmp
-          key: remote-files-${{ github.run_id }}
-          restore-keys: remote-files-
+          key: remote-files
+          restore-keys: remote-files
 
       - name: Check for changes
         id: check-changes
         run: |
+          # 如果脚本任意处出错，默认触发重建
+          trap 'echo "changes_detected=true" >> "$GITHUB_OUTPUT"; echo "Error in change detection, assuming changes" >&2' ERR
           set -eo pipefail
+
           CUSTOM_CHANGED=false
-          if [ -d custom ] && git diff --name-only HEAD^ HEAD -- custom/*.list | grep -q .; then
-            CUSTOM_CHANGED=true
-            echo "Custom files have changed"
+          if [ -d custom ]; then
+            if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+              if git diff --name-only HEAD^ HEAD -- custom/*.list | grep -q .; then
+                CUSTOM_CHANGED=true
+                echo "Custom files have changed"
+              fi
+            else
+              CUSTOM_CHANGED=true
+              echo "No previous commit, assuming custom files changed"
+            fi
           fi
 
           declare -A urls=(
@@ -79,35 +89,50 @@ jobs:
 
       - name: Create tlds.txt
         run: |
-          echo -e "com\ncn\norg\nnet\ncom.cn\norg.cn\nnet.cn\nedu\ngov\nio\nme\napp\ntv\ninfo\nco" > tlds.txt
+          cat <<EOF > tlds.txt
+          com
+          cn
+          org
+          net
+          com.cn
+          org.cn
+          net.cn
+          edu
+          gov
+          io
+          me
+          app
+          tv
+          info
+          co
+          EOF
 
       - name: Process rules
         run: |
           set -eo pipefail
-          # 处理 shadowrocket 的 direct/proxy/reject 规则
           declare -A urls=(
             [direct]="sr_direct_list.module"
             [proxy]="sr_proxy_list.module"
             [reject]="sr_reject_list.module"
           )
+
           for type in "${!urls[@]}"; do
             echo "Processing $type rules..."
             curl -s --max-time 15 --connect-timeout 5 "https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/${urls[$type]}" -o "temp.module" || { echo "Error fetching ${urls[$type]}, skipping"; continue; }
-            sed '1,/^\[Rule\]$/d' temp.module | \
-              sed "s/,${type^^}$//" | \
-              sed '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' > "shadowrocket/${type}.list"
+            sed '1,/^\[Rule\]$/d' temp.module \
+              | sed "s/,${type^^}$//" \
+              | sed '/^IP-CIDR\|^IP-ASN\|^GEOIP/s/$/,no-resolve/' \
+              > "shadowrocket/${type}.list"
             rm temp.module
             echo "Finished processing $type rules."
           done
 
-          # 追加 SteamCN 规则到 direct 列表中，并排序去重
           echo "Appending SteamCN rules..."
-          curl -s --max-time 15 --connect-timeout 5 https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list | \
-            grep -v '^#' >> shadowrocket/direct.list
+          curl -s --max-time 15 --connect-timeout 5 https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list \
+            | grep -v '^#' >> shadowrocket/direct.list
           sort -u shadowrocket/direct.list -o shadowrocket/direct.list
           echo "Finished appending SteamCN rules."
 
-          # 处理 custom 规则
           for type in direct proxy reject; do
             if [ -f "custom/${type}.list" ]; then
               echo "Appending custom $type rules..."
@@ -117,23 +142,17 @@ jobs:
             fi
           done
 
-          # 终极去重脚本
           for file in shadowrocket/*.list; do
             echo "Deduplicating $file..."
             awk -F',' '
               BEGIN {
-                # 加载顶级域
                 while ((getline < "tlds.txt") > 0) tlds[tolower($0)] = 1;
               }
               /^DOMAIN-SUFFIX,/ {
-                suffix = tolower($2);
-                suffixes[suffix] = $0;
-                next;
+                suffix = tolower($2); suffixes[suffix] = $0; next;
               }
               /^DOMAIN,/ {
-                domain = tolower($2);
-                domains[domain] = $0;
-                next;
+                domain = tolower($2); domains[domain] = $0; next;
               }
               /^URL-REGEX,/ {
                 regex = $2;
@@ -143,7 +162,6 @@ jobs:
               }
               { others[$0] = 1; next; }
               END {
-                # 第一步：过滤被 DOMAIN-SUFFIX 包含的 DOMAIN
                 for (domain in domains) {
                   keep = 1;
                   for (suffix in suffixes) {
@@ -153,8 +171,6 @@ jobs:
                   }
                   if (keep) filtered_domains[domain] = domains[domain];
                 }
-
-                # 第二步：过滤被其他 DOMAIN-SUFFIX 包含的 DOMAIN-SUFFIX
                 for (suffix in suffixes) {
                   keep = 1;
                   for (s in suffixes) {
@@ -164,8 +180,6 @@ jobs:
                   }
                   if (keep) filtered_suffixes[suffix] = suffixes[suffix];
                 }
-
-                # 第三步：过滤被 DOMAIN-SUFFIX 包含的 URL-REGEX
                 for (regex in regexes) {
                   keep = 1;
                   for (suffix in suffixes) {
@@ -175,8 +189,6 @@ jobs:
                   }
                   if (keep) filtered_regexes[regex] = regexes[regex];
                 }
-
-                # 输出结果
                 for (suffix in filtered_suffixes) print filtered_suffixes[suffix];
                 for (domain in filtered_domains) print filtered_domains[domain];
                 for (regex in keep_regexes) print keep_regexes[regex];
@@ -188,7 +200,6 @@ jobs:
             echo "Finished deduplicating $file."
           done
 
-          # 生成 mihomo 规则
           for type in direct proxy reject; do
             echo "Generating mihomo $type rules..."
             sed 's/^URL-REGEX/^DOMAIN-REGEX/' "shadowrocket/${type}.list" > "mihomo/${type}.list"
@@ -204,7 +215,7 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: ${{ env.COMMIT_MESSAGE }}
-          file_pattern: '"shadowrocket/*.list" "mihomo/*.list"'
+          file_pattern: 'shadowrocket/*.list mihomo/*.list'
           skip_dirty_check: false
 
       - name: Clean up temporary files
