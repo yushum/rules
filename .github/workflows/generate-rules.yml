@@ -13,13 +13,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 检出代码
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      # 缓存远程文件以检测变化
       - name: Cache previous remote files
         id: cache-remote
         uses: actions/cache@v3
@@ -32,18 +30,15 @@ jobs:
           key: remote-files-${{ github.run_id }}
           restore-keys: remote-files-
 
-      # 检测变化（自定义脚本）
       - name: Check for changes
         id: check-changes
         run: |
-          # 检查自定义文件变化
           CUSTOM_CHANGED=false
           if [ -d custom ] && git diff --name-only HEAD^ HEAD -- custom/*.list | grep -q .; then
             CUSTOM_CHANGED=true
             echo "Custom files have changed"
           fi
 
-          # 检查远程文件变化
           declare -A urls=(
             [direct]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_direct_list.module"
             [proxy]="https://raw.githubusercontent.com/GMOogway/shadowrocket-rules/master/sr_proxy_list.module"
@@ -73,7 +68,6 @@ jobs:
           fi
         continue-on-error: true
 
-      # 如果没有变化或检测失败，则退出
       - name: Exit if no changes
         if: steps.check-changes.outputs.changes_detected != 'true'
         run: |
@@ -85,11 +79,9 @@ jobs:
             exit 0
           fi
 
-      # 创建目录
       - name: Prepare folders
         run: mkdir -p shadowrocket mihomo custom
 
-      # 下载并处理规则
       - name: Process rules
         run: |
           declare -A urls=(
@@ -105,12 +97,10 @@ jobs:
             rm temp.module
           done
 
-          # 处理 SteamCN 规则
           curl -s https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/SteamCN/SteamCN.list | \
             grep -v '^#' >> shadowrocket/direct.list
           sort -u shadowrocket/direct.list -o shadowrocket/direct.list
 
-          # 合并自定义规则
           for type in direct proxy reject; do
             if [ -f "custom/${type}.list" ]; then
               grep -v '^#' "custom/${type}.list" >> "shadowrocket/${type}.list"
@@ -118,11 +108,15 @@ jobs:
             fi
           done
 
-          # 高效去重（使用 awk 处理 DOMAIN-SUFFIX 和 DOMAIN 包含关系）
+          # 终极去重脚本
           for file in shadowrocket/*.list; do
             awk -F',' '
               BEGIN {
-                delete suffixes; delete domains; delete others;
+                delete suffixes; delete domains; delete regexes; delete others;
+                # 定义常见顶级域（避免误判）
+                tlds["com"] = 1; tlds["cn"] = 1; tlds["org"] = 1; tlds["net"] = 1;
+                tlds["com.cn"] = 1; tlds["org.cn"] = 1; tlds["net.cn"] = 1;
+                tlds["edu"] = 1; tlds["gov"] = 1;
               }
               /^DOMAIN-SUFFIX,/ {
                 suffix = tolower($2);
@@ -134,28 +128,51 @@ jobs:
                 domains[domain] = $0;
                 next;
               }
+              /^URL-REGEX,/ {
+                regex = $2;  # 保留原始正则表达式
+                regexes[regex] = $0;
+                next;
+              }
               { others[$0] = 1; next; }
               END {
+                # 第一步：过滤被 DOMAIN-SUFFIX 包含的 DOMAIN
                 for (domain in domains) {
                   keep = 1;
                   for (suffix in suffixes) {
-                    if (domain == suffix || (index(domain, "." suffix) > 0 && domain ~ "[.]" suffix "$")) {
+                    if (!(suffix in tlds) && (domain == suffix || (index(domain, "." suffix) > 0 && domain ~ "[.]" suffix "$"))) {
                       keep = 0; break;
                     }
                   }
                   if (keep) filtered_domains[domain] = domains[domain];
                 }
+
+                # 第二步：过滤被其他 DOMAIN-SUFFIX 包含的 DOMAIN-SUFFIX
                 for (suffix in suffixes) {
                   keep = 1;
                   for (s in suffixes) {
-                    if (s != suffix && (index(suffix, "." s) > 0 && suffix ~ "[.]" s "$")) {
+                    if (s != suffix && !(s in tlds) && (index(suffix, "." s) > 0 && suffix ~ "[.]" s "$")) {
                       keep = 0; break;
                     }
                   }
                   if (keep) filtered_suffixes[suffix] = suffixes[suffix];
                 }
+
+                # 第三步：过滤被 DOMAIN-SUFFIX 包含的 URL-REGEX
+                for (regex in regexes) {
+                  keep = 1;
+                  for (suffix in suffixes) {
+                    if (!(suffix in tlds) && regex ~ "[.]" suffix "(/|$|[?])") {
+                      # 如果正则表达式完全匹配某个 suffix 且后接 /、结束或查询参数，则认为被覆盖
+                      keep = 0; break;
+                    }
+                  }
+                  if (keep) filtered_regexes[regex] = regexes[regex];
+                }
+
+                # 输出结果
                 for (suffix in filtered_suffixes) print filtered_suffixes[suffix];
                 for (domain in filtered_domains) print filtered_domains[domain];
+                for (regex in filtered_regexes) print filtered_regexes[regex];
                 for (other in others) print other;
               }
             ' "$file" | sort -u > temp_file.txt
@@ -167,10 +184,9 @@ jobs:
             sed 's/^URL-REGEX/^DOMAIN-REGEX/' "shadowrocket/${type}.list" > "mihomo/${type}.list"
           done
 
-      # 使用现成的 git-auto-commit-action 提交更改
       - name: Commit and Push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Update rule lists - ${{ github.run_id }} - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           file_pattern: 'shadowrocket/*.list mihomo/*.list'
-          skip_dirty_check: false  # 仅在有更改时提交
+          skip_dirty_check: false
